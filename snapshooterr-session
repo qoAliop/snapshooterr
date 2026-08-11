@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+set -e
+
+SESSION_ID="$(cat /proc/$$/stat | awk '{print $1}')-$(date +%s%N)"
+
+export SNAPSHOOTERR_SESSION_ID="$SESSION_ID"
+
+LOG_DIR="$HOME/.local/state/snapshooterr"
+mkdir -p "$LOG_DIR"
+
+export SNAPSHOOTERR_LOG="$LOG_DIR/$SESSION_ID.log"
+export SNAPSHOOTERR_TIMING="$LOG_DIR/$SESSION_ID.time"
+
+exec script \
+    --quiet \
+    --flush \
+    --timing="$SNAPSHOOTERR_TIMING" \
+    --log-out="$SNAPSHOOTERR_LOG" \
+    -c "fish"
