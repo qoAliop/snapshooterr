@@ -155,7 +155,10 @@ This installs both scripts and sets up the Fish configuration automatically.
 
 It's safe to run the installer again when updating the project.
 
-Where the data goes
+_______________
+
+
+**Where the data goes**
 
 Temporary session data is stored in:
 
@@ -167,7 +170,9 @@ Your actual snapshots are stored in:
 
 You don't need to create these directories yourself.
 
-Why I made it
+_______________
+
+**Why I made it**
 
 When doing pentesting, I don't really want to stop every few minutes to document:
 
