@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+BASE_DIR="$HOME/Documents/snapshooterr"
+STATE_DIR="$HOME/.local/state/snapshooterr"
+
+mkdir -p "$BASE_DIR" "$STATE_DIR"
+
+SESSION_ID="${SNAPSHOOTERR_SESSION_ID:-}"
+
+if [[ -z "$SESSION_ID" ]]; then
+    echo "snapshooterr: this terminal is not being recorded."
+    echo "Start this terminal with: snapshooterr-session"
+    exit 1
+fi
+
+LOG_FILE="${SNAPSHOOTERR_LOG:-$STATE_DIR/$SESSION_ID.log}"
+TIMING_FILE="${SNAPSHOOTERR_TIMING:-$STATE_DIR/$SESSION_ID.time}"
+SESSION_FILE="$STATE_DIR/$SESSION_ID.name"
+
+if [[ -f "$SESSION_FILE" ]]; then
+    SNAPSHOT_NAME="$(cat "$SESSION_FILE")"
+else
+    read -rp "Name this snapshot: " SNAPSHOT_NAME
+
+    if [[ -z "$SNAPSHOT_NAME" ]]; then
+        echo "Name cannot be empty."
+        exit 1
+    fi
+
+    SNAPSHOT_NAME="$(printf '%s' "$SNAPSHOT_NAME" | tr '/\:*?"<>|' '_')"
+    printf '%s' "$SNAPSHOT_NAME" > "$SESSION_FILE"
+fi
+
+read -rp "How many last inputs you wanna record? " COUNT
+
+if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [[ "$COUNT" -eq 0 ]]; then
+    echo "Please enter a positive number."
+    exit 1
+fi
+
+OUTPUT_FILE="$BASE_DIR/$SNAPSHOT_NAME.txt"
+
+if [[ ! -f "$LOG_FILE" ]]; then
+    echo "Recording log does not exist:"
+    echo "$LOG_FILE"
+    exit 1
+fi
+
+TEMP_LOG="$(mktemp)"
+TEMP_TIMING="$(mktemp)"
+
+cleanup() {
+    rm -f "$TEMP_LOG" "$TEMP_TIMING"
+}
+
+trap cleanup EXIT
+
+cp "$LOG_FILE" "$TEMP_LOG"
+
+if [[ -f "$TIMING_FILE" ]]; then
+    cp "$TIMING_FILE" "$TEMP_TIMING"
+else
+    : > "$TEMP_TIMING"
+fi
+
+python3 - \
+    "$TEMP_LOG" \
+    "$TEMP_TIMING" \
+    "$OUTPUT_FILE" \
+    "$COUNT" \
+    "$SNAPSHOT_NAME" \
+    "$SESSION_ID" <<'PY'
+
+import sys
+import re
+import urllib.parse
+from pathlib import Path
+from datetime import datetime, timedelta
+
+log_file = Path(sys.argv[1])
+timing_file = Path(sys.argv[2])
+output_file = Path(sys.argv[3])
+count = int(sys.argv[4])
+name = sys.argv[5]
+session_id = sys.argv[6]
+
+raw_data = log_file.read_text(errors="replace")
+
+data = re.sub(
+    r'^Script started on .*$',
+    '',
+    raw_data,
+    flags=re.MULTILINE
+)
+
+data = re.sub(
+    r'^Script done on .*$',
+    '',
+    data,
+    flags=re.MULTILINE
+)
+
+timing_entries = []
+
+if timing_file.exists():
+    elapsed = 0.0
+
+    for line in timing_file.read_text(errors="replace").splitlines():
+        parts = line.split()
+
+        if len(parts) < 2:
+            continue
+
+        try:
+            delay = float(parts[0])
+            characters = int(parts[1])
+        except ValueError:
+            continue
+
+        timing_entries.append((elapsed, characters))
+        elapsed += delay
+
+position_times = []
+position = 0
+
+for elapsed, characters in timing_entries:
+    position_times.append((position, elapsed))
+    position += characters
+
+def elapsed_at_position(pos):
+    if not position_times:
+        return 0.0
+
+    previous_time = 0.0
+
+    for start_position, elapsed in position_times:
+        if start_position > pos:
+            break
+
+        previous_time = elapsed
+
+    return previous_time
+
+session_start = None
+
+start_match = re.search(
+    r'Script started on '
+    r'(\d{4}-\d{2}-\d{2} '
+    r'\d{2}:\d{2}:\d{2})([+-]\d{2}:\d{2})',
+    raw_data
+)
+
+if start_match:
+    try:
+        session_start = datetime.fromisoformat(
+            start_match.group(1) + start_match.group(2)
+        )
+    except ValueError:
+        session_start = None
+
+command_pattern = re.compile(
+    r'\x1b\]133;C;cmdline_url=([^\x1b]*)\x1b\\'
+)
+
+end_pattern = re.compile(
+    r'\x1b\]133;D;[^\x1b]*\x1b\\'
+)
+
+commands = []
+
+for match in command_pattern.finditer(data):
+    encoded_command = match.group(1)
+
+    command = urllib.parse.unquote(
+        encoded_command
+    ).strip()
+
+    if not command:
+        continue
+
+    end_match = end_pattern.search(
+        data,
+        match.end()
+    )
+
+    if end_match is None:
+        continue
+
+    output = data[
+        match.end():end_match.start()
+    ]
+
+    output = output.replace('\r\n', '\n')
+    output = output.replace('\r', '\n')
+
+    output = re.sub(
+        r'\x1b\[[0-?]*[ -/]*[@-~]',
+        '',
+        output
+    )
+
+    output = re.sub(
+        r'\x1b\][^\a]*(?:\a|\x1b\\)',
+        '',
+        output
+    )
+
+    output = output.strip()
+
+    elapsed = elapsed_at_position(match.start())
+
+    if session_start is not None:
+        command_time = session_start + timedelta(seconds=elapsed)
+        timestamp = command_time.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    commands.append(
+        (
+            timestamp,
+            command,
+            output
+        )
+    )
+
+COMMAND_ONLY = {
+    "nano",
+    "vim",
+    "vi",
+    "nvim",
+    "less",
+    "more",
+    "man",
+    "top",
+    "htop",
+    "rm",
+    "rmdir",
+}
+
+cleaned_commands = []
+
+for timestamp, command, output in commands:
+    if command.strip() == "snapshooterr":
+        continue
+
+    parts = command.split()
+
+    if not parts:
+        continue
+
+    executable = parts[0].rsplit("/", 1)[-1]
+
+    if executable == "sudo" and len(parts) > 1:
+        executable = parts[1].rsplit("/", 1)[-1]
+
+    if executable == "env":
+        for part in parts[1:]:
+            if "=" not in part:
+                executable = part.rsplit("/", 1)[-1]
+                break
+
+    if executable in COMMAND_ONLY:
+        cleaned_commands.append(
+            (
+                timestamp,
+                command,
+                ""
+            )
+        )
+    else:
+        cleaned_commands.append(
+            (
+                timestamp,
+                command,
+                output
+            )
+        )
+
+commands = cleaned_commands[-count:]
+
+with output_file.open("a", encoding="utf-8") as f:
+    f.write("=" * 70 + "\n")
+    f.write(f"SNAPSHOOTERR: {name}\n")
+    f.write(f"SESSION: {session_id}\n")
+    f.write(
+        "GENERATED: "
+        + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        + "\n"
+    )
+    f.write("=" * 70 + "\n\n")
+
+    for timestamp, command, output in commands:
+        f.write(f"[{timestamp}] $ {command}\n")
+
+        if output:
+            f.write(output.rstrip() + "\n")
+
+        f.write("\n")
+
+print(f"Saved {len(commands)} commands to:")
+print(output_file)
+
+PY
